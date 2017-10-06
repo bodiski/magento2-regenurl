@@ -1,6 +1,9 @@
 <?php
 namespace Iazel\RegenProductUrl\Console\Command;
 
+use Magento\Catalog\Api\ProductRepositoryInterface;
+use Magento\Catalog\Model\Product\Attribute\Source\Status;
+use Magento\Catalog\Model\Product\Visibility;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Input\InputArgument;
@@ -34,14 +37,20 @@ class RegenerateProductUrlCommand extends Command
      * @var \Magento\Framework\App\State
      */
     protected $state;
+    /**
+     * @var ProductRepositoryInterface
+     */
+    protected $productRepository;
 
     public function __construct(
         State $state,
+        ProductRepositoryInterface $productRepository,
         Collection $collection,
         ProductUrlRewriteGenerator $productUrlRewriteGenerator,
         UrlPersistInterface $urlPersist
     ) {
         $this->state = $state;
+        $this->productRepository = $productRepository;
         $this->collection = $collection;
         $this->productUrlRewriteGenerator = $productUrlRewriteGenerator;
         $this->urlPersist = $urlPersist;
@@ -63,7 +72,8 @@ class RegenerateProductUrlCommand extends Command
                 'Use the specific Store View',
                 Store::DEFAULT_STORE_ID
             )
-            ;
+        ;
+
         return parent::configure();
     }
 
@@ -76,34 +86,53 @@ class RegenerateProductUrlCommand extends Command
             $this->state->setAreaCode('adminhtml');
         }
 
-        $store_id = $inp->getOption('store');
-        $this->collection->addStoreFilter($store_id)->setStoreId($store_id);
+        $storeId = $inp->getOption('store');
+
+        $this->collection->addStoreFilter($storeId)
+            ->setStoreId($storeId)
+            ->addAttributeToSelect(['url_path', 'url_key'])
+            ->addAttributeToFilter('status', ['eq' => Status::STATUS_ENABLED])
+            ->addAttributeToFilter('visibility', ['neq' => Visibility::VISIBILITY_NOT_VISIBLE])
+        ;
 
         $pids = $inp->getArgument('pids');
         if (!empty($pids)) {
             $this->collection->addIdFilter($pids);
         }
 
-        $this->collection->addAttributeToSelect(['url_path', 'url_key']);
-
+        $updateIds = [];
         foreach ($this->collection as $product) {
-            $product->setStoreId($store_id);
+            if (!$product->getData('url_key') || !$product->getData('url_path')) {
+                continue;
+            }
+
+            $updateIds[] = $product->getId();
+        }
+
+        // free up system resources
+        unset($this->collection);
+
+        foreach ($updateIds as $productId) {
+            $product = $this->productRepository->getById(
+                $productId,
+                false,
+                $storeId
+            );
 
             $this->urlPersist->deleteByData([
                 UrlRewrite::ENTITY_ID => $product->getId(),
                 UrlRewrite::ENTITY_TYPE => ProductUrlRewriteGenerator::ENTITY_TYPE,
-                UrlRewrite::REDIRECT_TYPE => 0,
-                UrlRewrite::STORE_ID => $store_id
             ]);
 
             try {
-                $this->urlPersist->replace(
-                    $this->productUrlRewriteGenerator->generate($product)
-                );
-            }
-            catch(\Exception $e) {
+                $this->urlPersist->replace($this->productUrlRewriteGenerator->generate($product));
+            } catch (\Exception $e) {
                 $out->writeln('<error>Duplicated url for '. $product->getId() .'</error>');
             }
+
+            unset($product);
         }
+
+        $out->writeln('<info>Total updated products: ' . count($updateIds) . '</info>');
     }
 }
